@@ -1,0 +1,80 @@
+// =============================================
+//  VERSÃO DE TESTE - processa apenas 100 contas
+//  Neo4j 2026 + APOC Extended + MySQL
+// =============================================
+
+CALL apoc.load.driver("com.mysql.cj.jdbc.Driver");
+
+WITH "jdbc:mysql://localhost:3306/seu_banco?user=SEU_USUARIO&password=SUA_SENHA" AS jdbcUrl
+
+CALL apoc.periodic.iterate(
+
+  // Iterador - busca apenas 100 contas para teste
+  'MATCH (c:Conta)
+   WHERE c.cliente_id IS NOT NULL
+   RETURN id(c) AS contaId, c.cliente_id AS clienteId
+   LIMIT 100',
+
+  // Ação - consulta as 3 tabelas MySQL e atualiza o nó
+  'WITH $jdbcUrl AS url, $contaId AS contaId, $clienteId AS clienteId
+  
+   CALL apoc.load.jdbc(url,
+       "SELECT 
+           COALESCE(l.limite_credito, 0) AS limite_credito,
+           COALESCE(SUM(h.valor), 0)     AS movimentacao_30d,
+           COALESCE(f.score_fraude_externo, 0) AS score_externo,
+           COALESCE(f.status_fraude, ''')    AS status_fraude
+        FROM limites_credito l
+        LEFT JOIN historico_financeiro h 
+           ON h.cliente_id = l.cliente_id 
+          AND h.data_movimento >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        LEFT JOIN lista_fraudes_externas f 
+           ON f.cliente_id = l.cliente_id
+        WHERE l.cliente_id = ?
+        GROUP BY l.limite_credito, f.score_fraude_externo, f.status_fraude",
+       [clienteId]
+   ) YIELD row
+   
+   // Re-binda o nó
+   MATCH (c:Conta) WHERE id(c) = contaId
+   
+   WITH c, row,
+        row.limite_credito       AS limite,
+        row.movimentacao_30d     AS mov30d,
+        row.score_externo        AS scoreExt,
+        row.status_fraude        AS statusExt
+   
+   // Regras de score (você pode ajustar os valores)
+   SET c.scoreFraude = coalesce(c.scoreFraude, 0) +
+                       CASE WHEN mov30d > (limite * 1.5) THEN 80 ELSE 0 END +
+                       CASE WHEN scoreExt > 700 THEN 120 ELSE 0 END +
+                       CASE WHEN scoreExt >= 400 AND scoreExt <= 700 THEN 60 ELSE 0 END +
+                       CASE WHEN statusExt = "bloqueado" THEN 200 ELSE 0 END,
+       
+       c.limiteCreditoMysql   = limite,
+       c.movimentacao30d      = mov30d,
+       c.scoreFraudeExterno   = scoreExt,
+       c.statusFraudeExterno  = statusExt,
+       c.ultimaAnaliseMysql   = datetime(),
+       c.analiseTeste         = true   // marca que foi teste
+
+   RETURN count(*) AS updatedInThisBatch',
+
+  // Configuração do batch (pequena para teste)
+  {
+    batchSize: 25,      // pequeno para teste
+    parallel: false,    // mais seguro com JDBC
+    retries: 2,
+    concurrency: 1
+  }
+)
+YIELD batches, total, committedOperations, failedOperations, timeTaken, errorMessages
+
+RETURN 
+  batches,
+  total,
+  committedOperations,
+  failedOperations,
+  timeTaken + " ms" AS duration,
+  CASE WHEN failedOperations = 0 THEN "✅ Teste executado com sucesso" 
+       ELSE "⚠️ Houve falhas - verifique errorMessages" END AS status;
